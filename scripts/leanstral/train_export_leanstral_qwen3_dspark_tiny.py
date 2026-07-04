@@ -13,6 +13,13 @@ from safetensors.torch import load_file, save_file
 from transformers import AutoConfig, Qwen3Config
 
 from deepspec.data.target_cache_dataset import CacheCollator, CacheDataset
+from deepspec.modeling.dspark.common import (
+    DSparkForwardOutput,
+    build_eval_mask,
+    create_dspark_attention_mask,
+    create_noise_embed,
+    create_position_ids,
+)
 from deepspec.modeling.dspark.loss import compute_dspark_loss
 from deepspec.modeling.dspark.qwen3 import Qwen3DSparkModel
 from scripts.leanstral.probe_leanstral_target import dump_json, sha256_file
@@ -104,17 +111,154 @@ def batch_to_device(batch, device):
     return out
 
 
+def build_prefix_boundary_anchors(cache_manifest, batch, device):
+    prefix_counts = cache_manifest.get("prefix_token_counts")
+    if prefix_counts is None:
+        raise ValueError(
+            "prefix-boundary anchor mode requires prefix_token_counts in "
+            "the cache manifest."
+        )
+    batch_size = int(batch["input_ids"].shape[0])
+    if len(prefix_counts) != batch_size:
+        raise ValueError(
+            "prefix_token_counts length does not match batch size: "
+            f"{len(prefix_counts)} != {batch_size}."
+        )
+    anchors = []
+    seq_len = int(batch["input_ids"].shape[1])
+    for sample_id, prefix_count in enumerate(prefix_counts):
+        anchor_position = int(prefix_count) - 1
+        if anchor_position < 0 or anchor_position >= seq_len - 1:
+            raise ValueError(
+                f"Invalid prefix-boundary anchor for sample {sample_id}: "
+                f"prefix_count={prefix_count}, seq_len={seq_len}."
+            )
+        anchors.append(anchor_position)
+    return torch.tensor(anchors, dtype=torch.long, device=device).view(batch_size, 1)
+
+
+def run_model_forward(model, batch, dtype, *, anchor_positions=None):
+    if anchor_positions is None:
+        return model(
+            input_ids=batch["input_ids"],
+            target_hidden_states=batch["target_hidden_states"].to(dtype=dtype),
+            loss_mask=batch["loss_mask"],
+            target_last_hidden_states=batch["target_last_hidden_states"].to(dtype=dtype),
+        )
+    return run_fixed_anchor_forward(
+        model=model,
+        batch=batch,
+        dtype=dtype,
+        anchor_positions=anchor_positions,
+    )
+
+
+def run_fixed_anchor_forward(model, batch, dtype, *, anchor_positions):
+    input_ids = batch["input_ids"].long()
+    loss_mask = batch["loss_mask"]
+    target_hidden_states = batch["target_hidden_states"].to(dtype=dtype)
+    target_last_hidden_states = batch["target_last_hidden_states"].to(dtype=dtype)
+
+    bsz, seq_len = input_ids.shape
+    device = input_ids.device
+    anchor_positions = anchor_positions.to(device=device, dtype=torch.long)
+    block_keep_mask = torch.ones(anchor_positions.shape, dtype=torch.bool, device=device)
+
+    noise_embedding = create_noise_embed(
+        model.embed_tokens,
+        input_ids,
+        anchor_positions,
+        block_keep_mask,
+        mask_token_id=int(model.mask_token_id),
+        block_size=int(model.block_size),
+    )
+    context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(
+        bsz,
+        -1,
+    )
+    draft_position_ids = create_position_ids(anchor_positions, int(model.block_size))
+    full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
+    attention_mask = create_dspark_attention_mask(
+        anchor_positions=anchor_positions,
+        block_keep_mask=block_keep_mask,
+        seq_len=seq_len,
+        block_size=int(model.block_size),
+        device=device,
+    )
+    output_hidden = model._forward_backbone(
+        position_ids=full_position_ids,
+        noise_embedding=noise_embedding,
+        target_hidden_states=target_hidden_states,
+        attention_mask=attention_mask,
+    )
+
+    num_blocks = int(anchor_positions.shape[1])
+    output_hidden_4d = output_hidden.reshape(bsz, num_blocks, int(model.block_size), -1)
+    label_offsets = torch.arange(1, int(model.block_size) + 1, device=device).view(
+        1,
+        1,
+        -1,
+    )
+    label_indices = anchor_positions.unsqueeze(-1) + label_offsets
+    safe_label_indices = label_indices.clamp(max=seq_len - 1)
+    target_ids = torch.gather(
+        input_ids.unsqueeze(1).expand(-1, num_blocks, -1),
+        2,
+        safe_label_indices,
+    )
+    target_pred_indices = (safe_label_indices - 1).clamp(min=0)
+    aligned_target_hidden = torch.gather(
+        target_last_hidden_states.unsqueeze(1).expand(-1, num_blocks, -1, -1),
+        2,
+        target_pred_indices.unsqueeze(-1).expand(
+            -1,
+            -1,
+            -1,
+            target_last_hidden_states.size(-1),
+        ),
+    )
+    aligned_target_logits = model.compute_logits(aligned_target_hidden)
+    eval_mask = build_eval_mask(
+        seq_len=seq_len,
+        loss_mask=loss_mask,
+        label_indices=label_indices,
+        safe_label_indices=safe_label_indices,
+        block_keep_mask=block_keep_mask,
+    )
+    anchor_token_ids = torch.gather(input_ids, 1, anchor_positions)
+    prev_token_ids = torch.cat(
+        [anchor_token_ids.unsqueeze(-1), target_ids[:, :, :-1]],
+        dim=-1,
+    )
+    draft_logits = model.compute_logits(output_hidden_4d)
+    if model.markov_head is not None:
+        draft_logits = model.markov_head.apply_block_logits(
+            draft_logits,
+            token_ids=prev_token_ids,
+            hidden_states=output_hidden_4d,
+        )
+
+    return DSparkForwardOutput(
+        draft_logits=draft_logits,
+        target_ids=target_ids,
+        eval_mask=eval_mask,
+        block_keep_mask=block_keep_mask,
+        confidence_pred=None,
+        aligned_target_logits=aligned_target_logits,
+    )
+
+
 @torch.no_grad()
-def evaluate_loss(model, batch, args, dtype, seed: int):
+def evaluate_loss(model, batch, args, dtype, seed: int, *, anchor_positions=None):
     torch.manual_seed(int(seed))
     if batch["input_ids"].is_cuda:
         torch.cuda.manual_seed_all(int(seed))
     model.eval()
-    outputs = model(
-        input_ids=batch["input_ids"],
-        target_hidden_states=batch["target_hidden_states"].to(dtype=dtype),
-        loss_mask=batch["loss_mask"],
-        target_last_hidden_states=batch["target_last_hidden_states"].to(dtype=dtype),
+    outputs = run_model_forward(
+        model,
+        batch,
+        dtype,
+        anchor_positions=anchor_positions,
     )
     loss = compute_dspark_loss(
         outputs=outputs,
@@ -274,6 +418,16 @@ def main():
     parser.add_argument("--ce-loss-alpha", type=float, default=0.1)
     parser.add_argument("--l1-loss-alpha", type=float, default=0.9)
     parser.add_argument("--loss-decay-gamma", type=float, default=4.0)
+    parser.add_argument(
+        "--anchor-mode",
+        choices=("random", "prefix-boundary"),
+        default="random",
+        help=(
+            "Anchor selection for training/eval. random uses the model sampler. "
+            "prefix-boundary uses prefix_token_counts from the cache manifest "
+            "and trains the first assistant-continuation boundary."
+        ),
+    )
     parser.add_argument("--rope-theta", type=float, default=10000.0)
     parser.add_argument("--rope-scaling-factor", type=float, default=128.0)
     parser.add_argument("--original-context-length", type=int, default=8192)
@@ -328,6 +482,13 @@ def main():
         finally:
             dataset.close()
         batch = batch_to_device(CacheCollator()(features), device)
+        fixed_anchor_positions = None
+        if args.anchor_mode == "prefix-boundary":
+            fixed_anchor_positions = build_prefix_boundary_anchors(
+                cache_manifest,
+                batch,
+                device,
+            )
 
         optimizer = torch.optim.AdamW(
             [param for param in model.parameters() if param.requires_grad],
@@ -341,6 +502,7 @@ def main():
             args,
             dtype,
             seed=int(args.seed) + 10_000,
+            anchor_positions=fixed_anchor_positions,
         )
         rows = []
         train_log_path = output_dir / "train_log.jsonl"
@@ -351,13 +513,11 @@ def main():
                 torch.cuda.manual_seed_all(step_seed)
             model.train()
             optimizer.zero_grad(set_to_none=True)
-            outputs = model(
-                input_ids=batch["input_ids"],
-                target_hidden_states=batch["target_hidden_states"].to(dtype=dtype),
-                loss_mask=batch["loss_mask"],
-                target_last_hidden_states=batch["target_last_hidden_states"].to(
-                    dtype=dtype
-                ),
+            outputs = run_model_forward(
+                model,
+                batch,
+                dtype,
+                anchor_positions=fixed_anchor_positions,
             )
             loss = compute_dspark_loss(
                 outputs=outputs,
@@ -401,6 +561,7 @@ def main():
             args,
             dtype,
             seed=int(args.seed) + 10_000,
+            anchor_positions=fixed_anchor_positions,
         )
 
         config_path = export_dir / "config.json"
@@ -424,6 +585,7 @@ def main():
             args,
             dtype,
             seed=int(args.seed) + 10_000,
+            anchor_positions=fixed_anchor_positions,
         )
         readback_loss_abs_diff = abs(readback_eval_loss - final_eval_loss)
         if readback_loss_abs_diff > float(args.loss_tolerance):
@@ -529,6 +691,15 @@ def main():
                 "ce_loss_alpha": float(args.ce_loss_alpha),
                 "l1_loss_alpha": float(args.l1_loss_alpha),
                 "confidence_head_alpha": float(args.confidence_head_alpha),
+                "anchor_mode": str(args.anchor_mode),
+                "fixed_anchor_positions": (
+                    [
+                        int(x)
+                        for x in fixed_anchor_positions.detach().cpu().view(-1).tolist()
+                    ]
+                    if fixed_anchor_positions is not None
+                    else None
+                ),
                 "initial_eval_loss": initial_eval_loss,
                 "final_eval_loss": final_eval_loss,
                 "step_log_path": str(train_log_path),
