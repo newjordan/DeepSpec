@@ -115,6 +115,33 @@ def build_probe_command(args, *, prompt_file: Path, probe_dir: Path):
     return command
 
 
+def build_bulk_probe_command(args, *, prompt_list: Path, probe_root: Path):
+    command = [
+        str(Path(args.probe_bin).resolve()),
+        "-m",
+        str(Path(args.model).resolve()),
+        "--out-dir",
+        str(probe_root),
+        "--prompt-list",
+        str(prompt_list),
+        "--layers",
+        str(args.layers),
+        "-ngl",
+        str(args.n_gpu_layers),
+        "-t",
+        str(args.threads),
+        "-tb",
+        str(args.threads_batch),
+    ]
+    if args.ctx_size > 0:
+        command.extend(["-c", str(args.ctx_size)])
+    if args.batch_size > 0:
+        command.extend(["-b", str(args.batch_size)])
+    if args.ubatch_size > 0:
+        command.extend(["-ub", str(args.ubatch_size)])
+    return command
+
+
 def run_probe(command, *, cwd: Path):
     started = datetime.now(timezone.utc)
     proc = subprocess.run(
@@ -266,6 +293,14 @@ def main():
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--output-dir")
     parser.add_argument("--layers", default="1,9,17,25,33")
+    parser.add_argument(
+        "--manifest-target-layer-ids",
+        help=(
+            "Layer ids to record in the DeepSpec cache manifest. Defaults to "
+            "--layers. Use this when llama.cpp extraction layers differ from "
+            "DeepSpec config ids by a runtime convention."
+        ),
+    )
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument(
         "--loss-mask",
@@ -281,6 +316,11 @@ def main():
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--threads-batch", type=int, default=8)
     parser.add_argument(
+        "--bulk-probe",
+        action="store_true",
+        help="Load the GGUF target once and process all prompt files via --prompt-list.",
+    )
+    parser.add_argument(
         "--model-sha256",
         default="4668fd2a6d2764de250489852230e96238eb5c0d7495866eb3b9c6c4fac5c7da",
     )
@@ -295,6 +335,14 @@ def main():
         raise FileNotFoundError(probe_bin)
 
     layer_ids = parse_layers(args.layers)
+    manifest_target_layer_ids = parse_layers(
+        args.manifest_target_layer_ids or args.layers
+    )
+    if len(manifest_target_layer_ids) != len(layer_ids):
+        raise ValueError(
+            "--manifest-target-layer-ids must contain the same number of layers "
+            "as --layers."
+        )
     records = load_prompt_records(
         args.input_jsonl,
         prompt_field=args.prompt_field,
@@ -316,6 +364,35 @@ def main():
     probe_root.mkdir(parents=True, exist_ok=True)
     rank_dir.mkdir(parents=True, exist_ok=True)
 
+    prompt_files = []
+    for sample_id, record in enumerate(records):
+        prompt_file = prompt_dir / f"sample-{sample_id:05d}.txt"
+        with open(prompt_file, "w", encoding="utf-8") as handle:
+            handle.write(record["prompt"])
+        prompt_files.append(prompt_file)
+
+    bulk_probe_result = None
+    bulk_probe_command_path = None
+    if args.bulk_probe:
+        prompt_list = output_dir / "prompt_list.txt"
+        with open(prompt_list, "w", encoding="utf-8") as handle:
+            for prompt_file in prompt_files:
+                handle.write(f"{prompt_file}\n")
+        command = build_bulk_probe_command(
+            args,
+            prompt_list=prompt_list,
+            probe_root=probe_root,
+        )
+        bulk_probe_result = run_probe(command, cwd=REPO_ROOT)
+        bulk_probe_command_path = probe_root / "bulk_probe_command.json"
+        atomic_json_dump(bulk_probe_result, str(bulk_probe_command_path))
+        if bulk_probe_result["returncode"] != 0:
+            raise RuntimeError(
+                "Bulk probe failed with return code "
+                f"{bulk_probe_result['returncode']}. "
+                f"See {bulk_probe_command_path}."
+            )
+
     writer = LocalTargetCacheWriter(
         rank_dir=str(rank_dir),
         max_shard_bytes=int(args.max_shard_bytes),
@@ -324,23 +401,31 @@ def main():
     hidden_size = None
     try:
         for sample_id, record in enumerate(records):
-            prompt_file = prompt_dir / f"sample-{sample_id:05d}.txt"
-            with open(prompt_file, "w", encoding="utf-8") as handle:
-                handle.write(record["prompt"])
+            prompt_file = prompt_files[sample_id]
             probe_dir = probe_root / f"sample-{sample_id:05d}"
             probe_dir.mkdir(parents=True, exist_ok=True)
-            command = build_probe_command(
-                args,
-                prompt_file=prompt_file,
-                probe_dir=probe_dir,
-            )
-            run_result = run_probe(command, cwd=REPO_ROOT)
-            atomic_json_dump(run_result, str(probe_dir / "probe_command.json"))
-            if run_result["returncode"] != 0:
-                raise RuntimeError(
-                    f"Probe failed for sample {sample_id} with return code "
-                    f"{run_result['returncode']}. See {probe_dir / 'probe_command.json'}."
+            if args.bulk_probe:
+                assert bulk_probe_result is not None
+                assert bulk_probe_command_path is not None
+                run_result = {
+                    "returncode": int(bulk_probe_result["returncode"]),
+                    "elapsed_seconds": float(bulk_probe_result["elapsed_seconds"]),
+                }
+                probe_command_path = bulk_probe_command_path
+            else:
+                command = build_probe_command(
+                    args,
+                    prompt_file=prompt_file,
+                    probe_dir=probe_dir,
                 )
+                run_result = run_probe(command, cwd=REPO_ROOT)
+                probe_command_path = probe_dir / "probe_command.json"
+                atomic_json_dump(run_result, str(probe_command_path))
+                if run_result["returncode"] != 0:
+                    raise RuntimeError(
+                        f"Probe failed for sample {sample_id} with return code "
+                        f"{run_result['returncode']}. See {probe_command_path}."
+                    )
             tensors = load_probe_tensors(probe_dir, layer_ids=layer_ids)
             if hidden_size is None:
                 hidden_size = int(tensors["hidden_size"])
@@ -370,8 +455,8 @@ def main():
                     },
                     "probe_dir": str(probe_dir),
                     "probe_command": {
-                        "path": str(probe_dir / "probe_command.json"),
-                        "sha256": sha256_file(probe_dir / "probe_command.json"),
+                        "path": str(probe_command_path),
+                        "sha256": sha256_file(probe_command_path),
                         "returncode": run_result["returncode"],
                         "elapsed_seconds": run_result["elapsed_seconds"],
                     },
@@ -416,13 +501,19 @@ def main():
     manifest = build_target_cache_manifest(
         num_samples=num_samples,
         shards=shards,
-        target_layer_ids=layer_ids,
+        target_layer_ids=manifest_target_layer_ids,
         hidden_size=hidden_size,
         extra_fields={
             "condition_name": "llama_prompt_shard_to_deepspec_cache",
-            "condition_label": "controlled_prompt_shard_cache_smoke",
+            "condition_label": (
+                "controlled_prompt_shard_cache_smoke_bulk_probe"
+                if args.bulk_probe
+                else "controlled_prompt_shard_cache_smoke"
+            ),
             "source_jsonl_paths": [str(Path(path).resolve()) for path in args.input_jsonl],
             "prompt_field": str(args.prompt_field),
+            "probe_layer_ids": layer_ids,
+            "manifest_target_layer_ids": manifest_target_layer_ids,
             "loss_mask_policy": str(args.loss_mask),
             "target_model_name_or_path": str(model_path),
             "target_model_sha256": str(args.model_sha256),
@@ -462,11 +553,15 @@ def main():
         ),
         "condition": {
             "name": "llama_prompt_shard_to_deepspec_cache",
-            "label": "controlled_prompt_shard_cache_smoke",
+            "label": (
+                "controlled_prompt_shard_cache_smoke_bulk_probe"
+                if args.bulk_probe
+                else "controlled_prompt_shard_cache_smoke"
+            ),
             "note": (
                 "This runs the frozen Leanstral NVFP4 llama.cpp activation "
-                "probe per prompt and writes a DeepSpec cache shard. It is not "
-                "a draft training run or benchmark."
+                "probe and writes a DeepSpec cache shard. It is not a draft "
+                "training run or benchmark."
             ),
             "argv": sys.argv,
             "working_directory": os.getcwd(),
@@ -492,7 +587,8 @@ def main():
         },
         "cache": {
             "dir": str(output_dir),
-            "target_layer_ids": layer_ids,
+            "probe_layer_ids": layer_ids,
+            "manifest_target_layer_ids": manifest_target_layer_ids,
             "hidden_size": int(hidden_size),
             "num_samples": int(num_samples),
             "num_shards": len(shards),
@@ -500,6 +596,18 @@ def main():
             "seq_lens": [int(sample["seq_len"]) for sample in samples],
             "loss_tokens": [int(sample["loss_tokens"]) for sample in samples],
         },
+        "bulk_probe": (
+            {
+                "enabled": True,
+                "command_artifact": {
+                    "path": str(bulk_probe_command_path),
+                    "sha256": sha256_file(bulk_probe_command_path),
+                },
+                "elapsed_seconds": bulk_probe_result["elapsed_seconds"],
+            }
+            if args.bulk_probe
+            else {"enabled": False}
+        ),
         "samples": samples,
         "output_artifacts": output_artifacts,
         "verification": verification,
