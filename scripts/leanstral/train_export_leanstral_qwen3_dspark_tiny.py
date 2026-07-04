@@ -137,7 +137,80 @@ def build_prefix_boundary_anchors(cache_manifest, batch, device):
     return torch.tensor(anchors, dtype=torch.long, device=device).view(batch_size, 1)
 
 
-def run_model_forward(model, batch, dtype, *, anchor_positions=None):
+def build_assistant_grid_anchors(cache_manifest, batch, device, num_anchors: int):
+    prefix_counts = cache_manifest.get("prefix_token_counts")
+    if prefix_counts is None:
+        raise ValueError(
+            "assistant-grid anchor mode requires prefix_token_counts in "
+            "the cache manifest."
+        )
+    batch_size = int(batch["input_ids"].shape[0])
+    if len(prefix_counts) != batch_size:
+        raise ValueError(
+            "prefix_token_counts length does not match batch size: "
+            f"{len(prefix_counts)} != {batch_size}."
+        )
+    max_anchors = int(num_anchors)
+    if max_anchors <= 0:
+        raise ValueError(f"num_anchors must be positive, got {max_anchors}.")
+
+    loss_mask = batch["loss_mask"]
+    attention_mask = batch["attention_mask"]
+    anchors = torch.zeros(batch_size, max_anchors, dtype=torch.long, device=device)
+    keep_mask = torch.zeros(batch_size, max_anchors, dtype=torch.bool, device=device)
+
+    for sample_id, prefix_count in enumerate(prefix_counts):
+        seq_len = int(attention_mask[sample_id].sum().item())
+        if seq_len <= 1:
+            continue
+        prefix_count = int(prefix_count)
+        candidates = []
+        boundary_anchor = prefix_count - 1
+        if (
+            0 <= boundary_anchor < seq_len - 1
+            and int(loss_mask[sample_id, boundary_anchor + 1].item()) > 0
+        ):
+            candidates.append(boundary_anchor)
+        for anchor_pos in range(max(prefix_count, 0), seq_len - 1):
+            if int(loss_mask[sample_id, anchor_pos + 1].item()) > 0:
+                candidates.append(anchor_pos)
+        if not candidates:
+            continue
+        if len(candidates) <= max_anchors:
+            selected = candidates
+        else:
+            selected_indices = torch.linspace(
+                0,
+                len(candidates) - 1,
+                steps=max_anchors,
+            ).round().to(torch.long).tolist()
+            selected = []
+            used = set()
+            for idx in selected_indices:
+                idx = int(idx)
+                if idx not in used:
+                    selected.append(candidates[idx])
+                    used.add(idx)
+            if len(selected) < max_anchors:
+                for idx, candidate in enumerate(candidates):
+                    if idx in used:
+                        continue
+                    selected.append(candidate)
+                    if len(selected) == max_anchors:
+                        break
+            selected = sorted(selected[:max_anchors])
+        n_selected = len(selected)
+        anchors[sample_id, :n_selected] = torch.tensor(
+            selected,
+            dtype=torch.long,
+            device=device,
+        )
+        keep_mask[sample_id, :n_selected] = True
+
+    return anchors, keep_mask
+
+
+def run_model_forward(model, batch, dtype, *, anchor_positions=None, block_keep_mask=None):
     if anchor_positions is None:
         return model(
             input_ids=batch["input_ids"],
@@ -150,10 +223,11 @@ def run_model_forward(model, batch, dtype, *, anchor_positions=None):
         batch=batch,
         dtype=dtype,
         anchor_positions=anchor_positions,
+        block_keep_mask=block_keep_mask,
     )
 
 
-def run_fixed_anchor_forward(model, batch, dtype, *, anchor_positions):
+def run_fixed_anchor_forward(model, batch, dtype, *, anchor_positions, block_keep_mask=None):
     input_ids = batch["input_ids"].long()
     loss_mask = batch["loss_mask"]
     target_hidden_states = batch["target_hidden_states"].to(dtype=dtype)
@@ -162,7 +236,10 @@ def run_fixed_anchor_forward(model, batch, dtype, *, anchor_positions):
     bsz, seq_len = input_ids.shape
     device = input_ids.device
     anchor_positions = anchor_positions.to(device=device, dtype=torch.long)
-    block_keep_mask = torch.ones(anchor_positions.shape, dtype=torch.bool, device=device)
+    if block_keep_mask is None:
+        block_keep_mask = torch.ones(anchor_positions.shape, dtype=torch.bool, device=device)
+    else:
+        block_keep_mask = block_keep_mask.to(device=device, dtype=torch.bool)
 
     noise_embedding = create_noise_embed(
         model.embed_tokens,
@@ -249,7 +326,16 @@ def run_fixed_anchor_forward(model, batch, dtype, *, anchor_positions):
 
 
 @torch.no_grad()
-def evaluate_loss(model, batch, args, dtype, seed: int, *, anchor_positions=None):
+def evaluate_loss(
+    model,
+    batch,
+    args,
+    dtype,
+    seed: int,
+    *,
+    anchor_positions=None,
+    block_keep_mask=None,
+):
     torch.manual_seed(int(seed))
     if batch["input_ids"].is_cuda:
         torch.cuda.manual_seed_all(int(seed))
@@ -259,6 +345,7 @@ def evaluate_loss(model, batch, args, dtype, seed: int, *, anchor_positions=None
         batch,
         dtype,
         anchor_positions=anchor_positions,
+        block_keep_mask=block_keep_mask,
     )
     loss = compute_dspark_loss(
         outputs=outputs,
@@ -420,12 +507,14 @@ def main():
     parser.add_argument("--loss-decay-gamma", type=float, default=4.0)
     parser.add_argument(
         "--anchor-mode",
-        choices=("random", "prefix-boundary"),
+        choices=("random", "prefix-boundary", "assistant-grid"),
         default="random",
         help=(
             "Anchor selection for training/eval. random uses the model sampler. "
             "prefix-boundary uses prefix_token_counts from the cache manifest "
-            "and trains the first assistant-continuation boundary."
+            "and trains the first assistant-continuation boundary. "
+            "assistant-grid uses prefix_token_counts and loss_mask to train "
+            "fixed anchors spread across each assistant continuation."
         ),
     )
     parser.add_argument("--rope-theta", type=float, default=10000.0)
@@ -483,11 +572,19 @@ def main():
             dataset.close()
         batch = batch_to_device(CacheCollator()(features), device)
         fixed_anchor_positions = None
+        fixed_block_keep_mask = None
         if args.anchor_mode == "prefix-boundary":
             fixed_anchor_positions = build_prefix_boundary_anchors(
                 cache_manifest,
                 batch,
                 device,
+            )
+        elif args.anchor_mode == "assistant-grid":
+            fixed_anchor_positions, fixed_block_keep_mask = build_assistant_grid_anchors(
+                cache_manifest,
+                batch,
+                device,
+                num_anchors=int(args.num_anchors),
             )
 
         optimizer = torch.optim.AdamW(
@@ -503,6 +600,7 @@ def main():
             dtype,
             seed=int(args.seed) + 10_000,
             anchor_positions=fixed_anchor_positions,
+            block_keep_mask=fixed_block_keep_mask,
         )
         rows = []
         train_log_path = output_dir / "train_log.jsonl"
@@ -518,6 +616,7 @@ def main():
                 batch,
                 dtype,
                 anchor_positions=fixed_anchor_positions,
+                block_keep_mask=fixed_block_keep_mask,
             )
             loss = compute_dspark_loss(
                 outputs=outputs,
@@ -562,6 +661,7 @@ def main():
             dtype,
             seed=int(args.seed) + 10_000,
             anchor_positions=fixed_anchor_positions,
+            block_keep_mask=fixed_block_keep_mask,
         )
 
         config_path = export_dir / "config.json"
@@ -586,6 +686,7 @@ def main():
             dtype,
             seed=int(args.seed) + 10_000,
             anchor_positions=fixed_anchor_positions,
+            block_keep_mask=fixed_block_keep_mask,
         )
         readback_loss_abs_diff = abs(readback_eval_loss - final_eval_loss)
         if readback_loss_abs_diff > float(args.loss_tolerance):
@@ -698,6 +799,19 @@ def main():
                         for x in fixed_anchor_positions.detach().cpu().view(-1).tolist()
                     ]
                     if fixed_anchor_positions is not None
+                    else None
+                ),
+                "fixed_anchor_shape": (
+                    [int(x) for x in fixed_anchor_positions.shape]
+                    if fixed_anchor_positions is not None
+                    else None
+                ),
+                "fixed_block_keep_mask": (
+                    [
+                        bool(x)
+                        for x in fixed_block_keep_mask.detach().cpu().view(-1).tolist()
+                    ]
+                    if fixed_block_keep_mask is not None
                     else None
                 ),
                 "initial_eval_loss": initial_eval_loss,
